@@ -203,7 +203,7 @@ class ANDHNavBatch(torch.utils.data.IterableDataset):
         for ix in range(0, len(self.data), batch_size):
             batch = self.data[ix: ix+batch_size]
             if len(batch) < batch_size:
-                random.shuffle(self.data)
+                # random.shuffle(self.data)
                 ix = batch_size - len(batch)
                 batch += self.data[:ix]
             
