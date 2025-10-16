@@ -462,7 +462,7 @@ class VLN_LLaVA_Adapter(nn.Module):
         return out, h_n, c_n
 
 # -----------------------
-# 条件分支加载函数
+# 新旧逻辑切换：条件分支加载函数
 # -----------------------
 def build_vln_model(args, vit_model=None):
     """
