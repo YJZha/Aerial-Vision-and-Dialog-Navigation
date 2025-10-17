@@ -32,13 +32,10 @@ from shapely.geometry import Polygon, MultiPoint
 from utils.logger import write_to_record_file, print_progress, timeSince
 
 
-# New imports for LLaVA + Adapter
-try:
-    from models.llava_wrapper import LLaVAWrapper
-    from models.adapter import Adapter
-except Exception:
-    LLaVAWrapper = None
-    Adapter = None
+# New imports for LLaVA + Adapter (explicit)
+from models.llava_wrapper import LLaVAWrapper
+from models.adapter import Adapter
+
 
 
 def debug_memory():
@@ -132,7 +129,7 @@ class NavCMTAgent:
         # self.vln_bert = VLNBertCMT(self.args).cuda()
         # self.critic = Critic(self.args).cuda()
         
-        self.tokenizer = BertTokenizerFast.from_pretrained("/mnt/EAI/zyj/Aerial-Vision-and-Dialog-Navigation/datasets/tokenizers/bert-base-uncased",local_files_only=True)
+        self.tokenizer = BertTokenizerFast.from_pretrained("/mnt/15td/Aerial-Vision-and-Dialog-Navigation/datasets/tokenizers/bert-base-uncased",local_files_only=True)
         self.lang_model = CustomBERTModel().cuda()
         
         self.img_tensor = transforms.ToTensor()
@@ -150,8 +147,7 @@ class NavCMTAgent:
         state.update(state_dict)
         self.vision_model.load_state_dict(state)
 
-
-        # create the et model
+        # create the et model (always create ET decoder; we'll feed it either darknet features or llava->adapter features)
         self.vln_model = ET(self.args).cuda()
         
         # self.vln_model = ViT_LSTM(
@@ -160,37 +156,62 @@ class NavCMTAgent:
         
                 
 
-        # optionally initialize LLaVA wrapper and adapter
+        # Optionally initialize LLaVA wrapper and adapter if requested
         self.use_llava = getattr(self.args, "use_llava", False)
         if self.use_llava:
-            if LLaVAWrapper is None or Adapter is None:
-                raise RuntimeError("LLaVA support requested but models.llava_wrapper or models.adapter not available.")
-            llava_path = getattr(self.args, "llava_path", None)
-            if llava_path is None:
-                raise RuntimeError("args.llava_path must be set when use_llava=True")
-            self.llava = LLaVAWrapper.from_pretrained(
-                llava_path,
-                out_dim=getattr(self.args, "llava_out_dim", 1024),
-                freeze=getattr(self.args, "freeze_llava", True),
-                device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            )
-            self.adapter = Adapter(
-                in_dim=getattr(self.args, "llava_out_dim", 1024),
-                bottleneck=getattr(self.args, "adapter_bottleneck", 256),
-                out_dim=49,
-                dropout=getattr(self.args, "adapter_dropout", 0.0)
-            ).cuda()
+            llava_dir = getattr(self.args, "llava_dir", None) or getattr(self.args, "llava_path", None)
+            if llava_dir is None:
+                raise RuntimeError("args.llava_dir (or args.llava_path) must be set when use_llava=True")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # instantiate wrapper and adapter
+            self.llava_wrapper = LLaVAWrapper.from_pretrained(llava_dir, device=device)
+            # compute wrapper output dim (vision_hidden + text_hidden)
+            in_dim = getattr(self.llava_wrapper.clip.config, "vision_config", None)
+            # determine dims robustly:
+            try:
+                vision_h = self.llava_wrapper.vision_hidden_size
+                text_h = self.llava_wrapper.text_hidden_size
+            except Exception:
+                vision_h = 768
+                text_h = 768
+            llava_out_dim = vision_h + text_h
+            # Adapter: project fused vector to (512,49)
+            self.adapter = Adapter(in_dim=llava_out_dim,
+                                mid_dim=getattr(self.args, "adapter_mid", 1024),
+                                out_c=512,
+                                out_w=49,
+                                dropout=getattr(self.args, "adapter_dropout", 0.0)).to(device)
+
+            if getattr(self.args, "freeze_llava", True):
+                for p in self.llava_wrapper.parameters():
+                    p.requires_grad = False
         else:
-            self.llava = None
+            self.llava_wrapper = None
             self.adapter = None
 
         # optimizer
         assert args.optim in ("adam", "adamW")
         OptimizerClass = torch.optim.Adam if args.optim == "adam" else torch.optim.AdamW
-        self.et_optimizer = OptimizerClass(filter(lambda p: p.requires_grad, self.vln_model.parameters()), lr=args.lr)
-        self.lang_model_optimizer = OptimizerClass(filter(lambda p: p.requires_grad, self.lang_model.parameters()), lr=self.args.lr)
-        self.vision_model_optimizer = OptimizerClass(filter(lambda p: p.requires_grad, self.vision_model.parameters()), lr=self.args.lr)
+
+        # Prepare parameter groups
+        et_params = list(filter(lambda p: p.requires_grad, self.vln_model.parameters()))
+        lang_params = list(filter(lambda p: p.requires_grad, self.lang_model.parameters()))
+        vision_params = list(filter(lambda p: p.requires_grad, self.vision_model.parameters()))
+
+        # include adapter params if using llava
+        if self.use_llava and (self.adapter is not None):
+            adapter_params = list(filter(lambda p: p.requires_grad, self.adapter.parameters()))
+        else:
+            adapter_params = []
+
+        # create optimizers
+        self.et_optimizer = OptimizerClass(et_params + adapter_params, lr=args.lr)
+        self.lang_model_optimizer = OptimizerClass(lang_params, lr=self.args.lr)
+        self.vision_model_optimizer = OptimizerClass(vision_params, lr=self.args.lr)
+
+        # keep tuple for older code compatibility
         self.optimizers = (self.et_optimizer, self.lang_model_optimizer, self.vision_model_optimizer)
+
 
         #         # Optimizers
         # if self.args.optim == 'rms':
@@ -619,15 +640,49 @@ class NavCMTAgent:
         for t in range(self.args.max_action_len):
             # print("- action rollingout takes %s seconds ---" % (time.time() - rollingout_action_start_time))
             # rollingout_action_start_time = time.time()
+            # --- Prepare images tensor ---
             images = []
             for i in range(len(obs)):
                 images.append(obs[i]['current_view'].copy())
-            images = np.stack(images)[:, :, :, ::-1].transpose(0, 3, 1, 2)  # W x H x C to C x W x H
+            images = np.stack(images)[:, :, :, ::-1].transpose(0, 3, 1, 2)  # HWC->CHW
             images = np.ascontiguousarray(images, dtype=np.float32)
+            # original darknet preprocessing
             images -= self.rgb_mean
             images /= self.rgb_std
-            im_feature = self.vision_model(torch.from_numpy(images).cuda())
-            im_feature = im_feature.view(im_feature.size(0), im_feature.size(1), -1)
+            images_t = torch.from_numpy(images).cuda()
+
+            # --- If using llava: get fused features via wrapper + adapter; else use vision_model (Darknet) ---
+            if self.use_llava and self.llava_wrapper is not None and self.adapter is not None:
+                # prepare llava text tokens using the llava-compatible tokenizer that LLaVAWrapper may provide
+                # we will attempt to use the same lang_inputs used earlier; build a simple tokenization
+                # (LLaVAWrapper does not ship tokenizer - user can adapt if they have specialized tokenizer)
+                try:
+                    # if LLaVAWrapper provided a tokenizer attribute, use it; otherwise assume user will provide input_ids in kwargs
+                    if hasattr(self.llava_wrapper, "tokenizer") and self.llava_wrapper.tokenizer is not None:
+                        llava_enc = self.llava_wrapper.tokenizer(lang_inputs, padding=True, return_tensors="pt")
+                        llava_input_ids = llava_enc["input_ids"].to(images_t.device)
+                        llava_attention_mask = llava_enc.get("attention_mask", None)
+                        if llava_attention_mask is not None:
+                            llava_attention_mask = llava_attention_mask.to(images_t.device)
+                    else:
+                        # fallback: use bert tokenizer to produce tokens for the text encoder (may not be ideal)
+                        bert_enc = self.tokenizer(lang_inputs, padding=True, return_tensors="pt")
+                        llava_input_ids = bert_enc["input_ids"].to(images_t.device)
+                        llava_attention_mask = bert_enc["attention_mask"].to(images_t.device)
+                except Exception:
+                    # if tokenization fails, fall back to no-text
+                    llava_input_ids = None
+                    llava_attention_mask = None
+
+                # call wrapper -> fused vector (B, llava_out_dim)
+                fused = self.llava_wrapper(images_t, input_ids=llava_input_ids, attention_mask=llava_attention_mask)
+                # adapter maps to (B, 512, 49)
+                im_feature = self.adapter(fused)  # (B, 512, 49)
+            else:
+                # original darknet pipeline
+                im_feature = self.vision_model(images_t.cuda())
+                im_feature = im_feature.view(im_feature.size(0), im_feature.size(1), -1)
+
             
             # pos_tensor = []
             # for i in range(len(obs)):
@@ -947,6 +1002,8 @@ class NavCMTAgent:
                      ("vision_model", self.vision_model, self.vision_model_optimizer),
                      ("vln_model", self.vln_model, self.et_optimizer),
                         ]
+        if self.use_llava and self.adapter is not None:
+            all_tuple.append(("adapter", self.adapter, self.et_optimizer))
         for param in all_tuple:
             create_state(*param)
         torch.save(states, path)
@@ -976,6 +1033,8 @@ class NavCMTAgent:
         all_tuple = [("lang_model", self.lang_model, self.lang_model_optimizer),
                     ("vision_model", self.vision_model, self.vision_model_optimizer),
                     ("vln_model", self.vln_model, self.et_optimizer)]
+        if self.use_llava and self.adapter is not None:
+            all_tuple.append(("adapter", self.adapter, self.et_optimizer))
         for param in all_tuple:
             recover_state(*param)
         return states['vln_model']['epoch'] - 1

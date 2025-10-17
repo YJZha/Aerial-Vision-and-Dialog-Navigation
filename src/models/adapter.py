@@ -1,34 +1,30 @@
 # models/adapter.py
 import torch
 import torch.nn as nn
+import math
 
 class Adapter(nn.Module):
     """
-    Lightweight bottleneck adapter to map LLaVA features -> 49-d per-frame attention vector.
-    Input: (B, T, in_dim)
-    Output: (B, T, out_dim) where out_dim is 49 to match downstream att_frame_feature
+    Adapter that projects fused LLaVA vector to (512,49) per sample.
+    Input: (B, in_dim)
+    Output: (B, 512, 49)
     """
-    def __init__(self, in_dim: int, bottleneck: int = 256, out_dim: int = 49, dropout: float = 0.0):
+    def __init__(self, in_dim=768*2, mid_dim=1024, out_c=512, out_w=49, dropout=0.0):
         super().__init__()
         self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.down = nn.Linear(in_dim, bottleneck)
-        self.act = nn.GELU()
-        self.up = nn.Linear(bottleneck, out_dim)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        # residual projection if dims don't align (here in_dim != out_dim typically)
-        self.res_proj = nn.Linear(in_dim, out_dim) if in_dim != out_dim else None
-        self.norm = nn.LayerNorm(out_dim)
+        self.mid = nn.Sequential(
+            nn.Linear(in_dim, mid_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.out_dim = out_c * out_w
+        self.proj = nn.Linear(mid_dim, self.out_dim)
+        self.out_c = out_c
+        self.out_w = out_w
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D_in)
-        assert x.dim() == 3, f"Adapter expects 3D input (B,T,D), got {x.shape}"
-        res = x
-        x = self.down(x)      # (B,T,bottleneck)
-        x = self.act(x)
-        x = self.up(x)        # (B,T,out_dim)
-        x = self.dropout(x)
-        if self.res_proj is not None:
-            res = self.res_proj(res)
-        out = self.norm(x + res)
-        return out
+    def forward(self, x):
+        # x: (B, in_dim)
+        h = self.mid(x)
+        p = self.proj(h)  # (B, out_c*out_w)
+        p = p.view(-1, self.out_c, self.out_w)
+        return p

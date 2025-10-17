@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 from transformers import AutoModel, BertTokenizerFast
+from models.llava_wrapper import LLaVAWrapper
 
 class SoftDotAttention(nn.Module):
     '''Soft Dot Attention. 
@@ -128,7 +129,7 @@ class pre_direction(nn.Module):
 class CustomBERTModel(nn.Module):
     def __init__(self):
         super(CustomBERTModel, self).__init__()
-        self.bert = AutoModel.from_pretrained("/mnt/EAI/zyj/Aerial-Vision-and-Dialog-Navigation/datasets/tokenizers/bert-base-uncased",local_files_only=True)
+        self.bert = AutoModel.from_pretrained("/mnt/15td/Aerial-Vision-and-Dialog-Navigation/datasets/tokenizers/bert-base-uncased",local_files_only=True)
         # freeze_network(self.bert)
         # for child in self.bert.children():
         #     # ct += 1
@@ -413,65 +414,21 @@ class ViT_LSTM_lang_only(nn.Module):
 
 
 # -----------------------
-# 新逻辑：LLaVA + Adapter 分支
-# -----------------------
-from transformers import AutoModelForCausalLM
-
-class Adapter(nn.Module):
-    def __init__(self, input_dim=768, output_dim=512):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, output_dim)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(output_dim, output_dim)
-
-    def forward(self, x):
-        return self.fc2(self.relu(self.fc1(x)))
-
-class LLaVA_Fusion(nn.Module):
-    def __init__(self, llava_dir):
-        super().__init__()
-        # 加载 LLaVA 模型（多模态）
-        self.llava_text_model = AutoModel.from_pretrained(f"{llava_dir}/vicuna-7b-v1.5", local_files_only=True)
-        self.llava_vision_model = AutoModel.from_pretrained(f"{llava_dir}/clip-vit-large-patch14-336", local_files_only=True)
-        self.adapter = Adapter(input_dim=768, output_dim=512)
-
-    def forward(self, images, dialogs):
-        # 获取视觉特征
-        vision_feats = self.llava_vision_model(images).last_hidden_state.mean(dim=1)
-        # 获取文本特征
-        text_feats = self.llava_text_model(**dialogs).last_hidden_state[:, 0, :]
-        fused = vision_feats + text_feats
-        return self.adapter(fused)
-
-class VLN_LLaVA_Adapter(nn.Module):
-    def __init__(self, args, llava_dir):
-        super().__init__()
-        self.args = args
-        self.llava_fusion = LLaVA_Fusion(llava_dir)
-        self.lstm = nn.LSTM(input_size=512, hidden_size=512, batch_first=True)
-        self.fc = nn.Linear(512, 4)  # 输出动作向量 (x, y, h, stop)
-
-    def forward(self, images, dialogs, h_0=None, c_0=None):
-        fused_feats = self.llava_fusion(images, dialogs)
-        fused_feats = fused_feats.unsqueeze(1)  # batch x seq_len x dim
-        if h_0 is None or c_0 is None:
-            lstm_out, (h_n, c_n) = self.lstm(fused_feats)
-        else:
-            lstm_out, (h_n, c_n) = self.lstm(fused_feats, (h_0, c_0))
-        out = self.fc(lstm_out[:, -1, :])
-        return out, h_n, c_n
-
-# -----------------------
 # 新旧逻辑切换：条件分支加载函数
 # -----------------------
 def build_vln_model(args, vit_model=None):
     """
     构建模型：
-    - use_llava=True -> 使用 VLN_LLaVA_Adapter 分支
+    - use_llava=True -> 使用 LLaVAWrapper 分支
     - use_llava=False -> 使用原 ViT_LSTM 分支
     """
     if getattr(args, 'use_llava', False):
-        return VLN_LLaVA_Adapter(args, llava_dir=args.llava_dir)
+        return LLaVAWrapper(
+            llava_dir=args.llava_dir,
+            freeze_llava=getattr(args, 'freeze_llava', False),
+            adapter_mid=getattr(args, 'adapter_mid', 512),
+            adapter_dropout=getattr(args, 'adapter_dropout', 0.1)
+        )
     else:
         assert vit_model is not None, "vit_model must be provided for ViT_LSTM branch"
         return ViT_LSTM(args, vit_model)

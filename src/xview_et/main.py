@@ -23,7 +23,7 @@ from xview_et.parser import parse_args
 def get_tokenizer(args):
     from transformers import AutoTokenizer
     cfg_name = 'bert-base-uncased'
-    tokenizer = AutoTokenizer.from_pretrained("/mnt/EAI/zyj/Aerial-Vision-and-Dialog-Navigation/datasets/tokenizers/bert-base-uncased")
+    tokenizer = AutoTokenizer.from_pretrained("/mnt/15td/Aerial-Vision-and-Dialog-Navigation/datasets/tokenizers/bert-base-uncased")
     return tokenizer
 
 def build_dataset(args, rank=0, is_test=False):

@@ -98,6 +98,21 @@ def parse_args():
     parser.add_argument('--image_feat_size', type=int, default=2048)
     parser.add_argument('--views', type=int, default=36)
 
+    # LLaVA and Adapter integration
+    parser.add_argument('--use_llava', action='store_true', default=False,
+                        help='Enable to use LLaVA multimodal fusion instead of original visual-language encoder.')
+    parser.add_argument('--llava_dir', type=str,
+                        default='/mnt/15td/Aerial-Vision-and-Dialog-Navigation/datasets/llava',
+                        help='Root directory containing llava-v1.5-7b, clip-vit-large-patch14-336, and vicuna-7b-v1.5.')
+    parser.add_argument('--llava_model_name', type=str, default='llava-v1.5-7b')
+    parser.add_argument('--clip_model_name', type=str, default='clip-vit-large-patch14-336')
+    parser.add_argument('--vicuna_model_name', type=str, default='vicuna-7b-v1.5')
+    parser.add_argument('--freeze_llava', action='store_true', default=True,
+                        help='Freeze LLaVA parameters during training (train adapter + ET decoder only).')
+    parser.add_argument('--adapter_hidden', type=int, default=512,
+                        help='Hidden dimension of adapter projection layer.')
+    parser.add_argument('--adapter_dropout', type=float, default=0.1,
+                        help='Dropout in adapter layer.')
 
     args, _ = parser.parse_known_args()
 
